@@ -289,11 +289,11 @@ async function loadUsers() {
         }
         
         // First, get ALL users to see what's in database
-        console.log('📡 Fetching ALL users from database (public view)...');
-        // Query the safe public view (public_profiles) so RLS doesn't leak sensitive fields
+        console.log('📡 Fetching ALL users from database (profiles table)...');
+        // Query the profiles table (RLS policies control access)
         const { data: allDbUsers, error: allError } = await supabaseClient
-            .from('public_profiles')
-            .select('id, name, username, avatar_url, public_key, key_fingerprint, created_at')
+            .from('profiles')
+            .select('id, user_id, email, full_name, avatar_url, public_key, created_at')
             .order('created_at', { ascending: false });
         
         if (allError) {
@@ -319,11 +319,11 @@ async function loadUsers() {
         
         // Now get users excluding current user (keep for search)
         console.log('📡 Fetching OTHER users (excluding current user)...');
-        // For other users shown in the UI, fetch only non-sensitive profile columns
+        // For other users shown in the UI, fetch profile data
         const { data: users, error } = await supabaseClient
-            .from('public_profiles')
-            .select('id, name, username, avatar_url, public_key, key_fingerprint')
-            .neq('id', currentUser.id)
+            .from('profiles')
+            .select('id, user_id, email, full_name, avatar_url, public_key')
+            .neq('user_id', currentUser.id)
             .order('created_at', { ascending: false });
         
         if (error) {
