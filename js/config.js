@@ -8,5 +8,6 @@ const VIRUSTOTAL_API_KEY = '8a2a9809b18ab04dc168df26000af4490beeaf2d4a42e1b90f19
 
 // Application-level encryption key (Base64-encoded 32 bytes).
 // WARNING: For production, do NOT store this in client-side code. Move to a secure server / environment.
-const SUPABASE_APP_KEY = 'J692LNJ1t6CrNVQChVayAAEg3mPig5BRin6HjRSajZU='; // Generate using: openssl rand -base64 32
+const SUPABASE_APP_KEY = 'EVDTfkF5bbwb2MkMMcD6JYG5yc5wn8+yZmME4+d2Qc0='; // Generate using: openssl rand -base64 32
+
 
