@@ -1,7 +1,3 @@
-# Ignore SQL migration files and markdown docs as requested
-*.sql
-*.md
-
 # Node / editor artifacts (keep safe defaults)
 node_modules/
 .env
@@ -47,20 +43,28 @@ build/
 *.bak
 *.backup
 
-# SQL setup files
+# SQL setup files (allow setup scripts)
 *.sql
+!database_schema.sql
+!storage_setup.sql
 
-# Documentation files (except README.md)
+# Documentation files (Keep important setup docs, ignore temporary docs)
 *_EXPLAINED.md
-*_GUIDE.md
 *_FIX.md
-*_SETUP.md
 *_SUMMARY.md
 CHANGES*.md
-DEPLOY*.md
 GITHUB*.md
 JWT*.md
 PASSWORDLESS*.md
-QUICK*.md
 TESTING*.md
 USERS*.md
+# Keep all our setup documentation
+!SETUP_GUIDE.md
+!README.md
+!DEPLOYMENT_CHECKLIST.md
+!GET_STARTED.md
+!START_HERE.md
+!INDEX.md
+!COMMANDS.md
+!WORKFLOW.md
+!SUPABASE_CLI_WINDOWS.md
