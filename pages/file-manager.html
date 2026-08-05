@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>File Manager - Flowsec</title>
     <link rel="stylesheet" href="../css/chat.css">
+    <link rel="stylesheet" href="../css/responsive.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         .file-manager-container {
@@ -179,7 +180,38 @@
             <!-- Stats will be loaded here -->
         </div>
 
+        <!-- Users Section -->
+        <div class="file-table" style="margin-bottom: 30px;">
+            <div style="padding: 20px; background: #f5f5f5; border-bottom: 2px solid #e0e0e0;">
+                <h2 style="margin: 0; color: #333;">
+                    <i class="fas fa-users"></i> All Users 
+                    <span id="users-count" style="color: #4CAF50; font-size: 18px;">(0)</span>
+                </h2>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Name</th>
+                        <th>Username</th>
+                        <th>Email</th>
+                        <th>Gender</th>
+                        <th>Joined</th>
+                    </tr>
+                </thead>
+                <tbody id="users-tbody">
+                    <!-- Users will be loaded here -->
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Files Section -->
         <div class="file-table">
+            <div style="padding: 20px; background: #f5f5f5; border-bottom: 2px solid #e0e0e0;">
+                <h2 style="margin: 0; color: #333;">
+                    <i class="fas fa-folder"></i> All Files
+                </h2>
+            </div>
             <table>
                 <thead>
                     <tr>
@@ -211,8 +243,8 @@
 
         async function init() {
             try {
-                // Initialize VirusTotal service
-                virusTotalService = new VirusTotalService(VIRUSTOTAL_API_KEY);
+                // Initialize VirusTotal service with Supabase URL (uses proxy)
+                virusTotalService = new VirusTotalService(SUPABASE_URL);
 
                 // Get current user
                 const { data: { user }, error } = await supabaseClient.auth.getUser();
@@ -233,6 +265,9 @@
                 // Load private key for decryption
                 await loadPrivateKey();
 
+                // Load users first
+                await loadUsers();
+
                 // Load files
                 await loadFiles();
             } catch (error) {
@@ -241,21 +276,141 @@
             }
         }
 
+        async function loadUsers() {
+            try {
+                console.log('👥 Loading all users from database...');
+                
+                const { data: users, error } = await supabaseClient
+                    .from('profiles')
+                    .select('id, name, username, email, gender, created_at, avatar_url')
+                    .order('created_at', { ascending: false });
+
+                if (error) {
+                    console.error('Failed to load users:', error);
+                    throw error;
+                }
+
+                console.log(`✅ Loaded ${users.length} users`);
+                displayUsers(users);
+            } catch (error) {
+                console.error('Failed to load users:', error);
+                document.getElementById('users-tbody').innerHTML = `
+                    <tr><td colspan="6" style="text-align: center; padding: 40px;">
+                        <p style="color: #999;">Failed to load users</p>
+                    </td></tr>
+                `;
+            }
+        }
+
+        function displayUsers(users) {
+            const tbody = document.getElementById('users-tbody');
+            const usersCount = document.getElementById('users-count');
+            
+            usersCount.textContent = `(${users.length})`;
+            
+            if (users.length === 0) {
+                tbody.innerHTML = `
+                    <tr><td colspan="6" style="text-align: center; padding: 40px;">
+                        <i class="fas fa-users" style="font-size: 48px; color: #ddd; margin-bottom: 15px;"></i>
+                        <p style="color: #999;">No users found</p>
+                    </td></tr>
+                `;
+                return;
+            }
+
+            tbody.innerHTML = users.map((user, index) => {
+                const joinedDate = new Date(user.created_at).toLocaleDateString();
+                const isCurrentUser = user.id === currentUser.id;
+                
+                return `
+                    <tr style="${isCurrentUser ? 'background-color: #e8f5e9;' : ''}">
+                        <td><strong>${index + 1}</strong></td>
+                        <td>
+                            <div style="display: flex; align-items: center; gap: 10px;">
+                                ${user.avatar_url ? `<img src="${user.avatar_url}" alt="${user.name}" style="width: 32px; height: 32px; border-radius: 50%; object-fit: cover;" onerror="this.style.display='none'">` : ''}
+                                <span style="font-weight: 600;">${user.name || 'N/A'}</span>
+                                ${isCurrentUser ? '<span style="color: #4CAF50; font-size: 12px; margin-left: 5px;">(You)</span>' : ''}
+                            </div>
+                        </td>
+                        <td><span style="color: #2196F3;">@${user.username || 'N/A'}</span></td>
+                        <td><span style="color: #666;">${user.email || 'N/A'}</span></td>
+                        <td>${user.gender || 'N/A'}</td>
+                        <td>${joinedDate}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
         async function loadPrivateKey() {
             try {
-                const password = sessionStorage.getItem('tempPassword') || currentUser.email;
+                console.log('🔍 Loading private key for user:', currentUser.id);
                 
+                // Get password from sessionStorage (set during login) or fallback to email
+                const { data: { user } } = await supabaseClient.auth.getUser();
+                let password = sessionStorage.getItem('tempPassword');
+                
+                if (!password) {
+                    console.warn('⚠️ No password in sessionStorage, using email as fallback');
+                    password = user.email;
+                }
+                
+                console.log('🔐 Password source:', sessionStorage.getItem('tempPassword') ? 'sessionStorage' : 'email fallback');
+                
+                // Check if private key exists in localStorage
                 if (EncryptionService.hasPrivateKey(currentUser.id)) {
-                    privateKey = await EncryptionService.retrievePrivateKey(currentUser.id, password);
+                    console.log('✅ Private key found in localStorage, decrypting...');
+                    try {
+                        privateKey = await EncryptionService.retrievePrivateKey(currentUser.id, password);
+                        console.log('✅ Private key loaded successfully');
+                    } catch (decryptError) {
+                        console.error('❌ Failed to decrypt with stored password, prompting user...');
+                        // Prompt for password
+                        password = prompt('Enter your password to decrypt your encryption key:');
+                        if (password) {
+                            privateKey = await EncryptionService.retrievePrivateKey(currentUser.id, password);
+                            // Store it for this session
+                            sessionStorage.setItem('tempPassword', password);
+                            console.log('✅ Private key loaded with user-provided password');
+                        }
+                    }
                 } else if (currentUser.encrypted_private_key) {
-                    privateKey = await EncryptionService.decryptPrivateKeyFromBackup(
-                        currentUser.encrypted_private_key,
-                        password
-                    );
-                    await EncryptionService.storePrivateKey(privateKey, currentUser.id, password);
+                    console.log('🔐 Private key not in localStorage, trying server backup...');
+                    try {
+                        privateKey = await EncryptionService.decryptPrivateKeyFromBackup(
+                            currentUser.encrypted_private_key,
+                            password
+                        );
+                        // Cache it for next time
+                        await EncryptionService.storePrivateKey(privateKey, currentUser.id, password);
+                        console.log('✅ Private key restored from backup and cached');
+                    } catch (decryptError) {
+                        console.error('❌ Failed to decrypt backup, prompting user...');
+                        // Prompt for password
+                        password = prompt('Enter your password to decrypt your encryption key:');
+                        if (password) {
+                            privateKey = await EncryptionService.decryptPrivateKeyFromBackup(
+                                currentUser.encrypted_private_key,
+                                password
+                            );
+                            await EncryptionService.storePrivateKey(privateKey, currentUser.id, password);
+                            sessionStorage.setItem('tempPassword', password);
+                            console.log('✅ Private key restored with user-provided password');
+                        }
+                    }
+                } else {
+                    console.warn('⚠️ No private key found - user may need to set up encryption');
                 }
             } catch (error) {
-                console.error('Failed to load private key:', error);
+                console.error('❌ Failed to load private key:', error);
+                const retry = confirm('Failed to load encryption key. This may be because:\n\n1. Wrong password\n2. Keys not set up\n3. Browser data was cleared\n\nYou may not be able to download encrypted files.\n\nWould you like to try entering your password manually?');
+                
+                if (retry) {
+                    const password = prompt('Enter your password:');
+                    if (password) {
+                        sessionStorage.setItem('tempPassword', password);
+                        await loadPrivateKey(); // Retry
+                    }
+                }
             }
         }
 
@@ -275,7 +430,7 @@
             }
         }
 
-        function displayStats(files) {
+        async function displayStats(files) {
             const totalFiles = files.length;
             const sentFiles = files.filter(f => f.sender_id === currentUser.id).length;
             const receivedFiles = files.filter(f => f.receiver_id === currentUser.id).length;
@@ -283,27 +438,36 @@
             const threatsDetected = files.filter(f => f.vt_positives > 0).length;
             const totalSize = files.reduce((sum, f) => sum + f.file_size, 0);
 
+            // Get total users count
+            const { count: usersCount } = await supabaseClient
+                .from('profiles')
+                .select('*', { count: 'exact', head: true });
+
             document.getElementById('file-stats').innerHTML = `
                 <div class="stat-card">
-                    <h3>Total Files</h3>
+                    <h3><i class="fas fa-users"></i> Total Users</h3>
+                    <div class="value" style="color: #667eea;">${usersCount || 0}</div>
+                </div>
+                <div class="stat-card">
+                    <h3><i class="fas fa-folder"></i> Total Files</h3>
                     <div class="value">${totalFiles}</div>
                 </div>
                 <div class="stat-card">
-                    <h3>Sent / Received</h3>
+                    <h3><i class="fas fa-exchange-alt"></i> Sent / Received</h3>
                     <div class="value" style="font-size: 20px;">${sentFiles} / ${receivedFiles}</div>
                 </div>
                 <div class="stat-card">
-                    <h3>Clean Files</h3>
+                    <h3><i class="fas fa-check-circle"></i> Clean Files</h3>
                     <div class="value" style="color: #4CAF50;">${cleanFiles}</div>
                 </div>
                 <div class="stat-card">
-                    <h3>Threats Detected</h3>
+                    <h3><i class="fas fa-exclamation-triangle"></i> Threats</h3>
                     <div class="value" style="color: ${threatsDetected > 0 ? '#f44336' : '#4CAF50'};">
                         ${threatsDetected}
                     </div>
                 </div>
                 <div class="stat-card">
-                    <h3>Total Size</h3>
+                    <h3><i class="fas fa-database"></i> Total Size</h3>
                     <div class="value" style="font-size: 20px;">${fileService.formatFileSize(totalSize)}</div>
                 </div>
             `;

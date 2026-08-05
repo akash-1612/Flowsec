@@ -18,6 +18,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Check authentication
     await checkAuth();
     
+    // Create or validate session
+    await initializeSession();
+    
     // Load current user profile
     await loadCurrentUser();
     
@@ -102,6 +105,36 @@ async function checkAuth() {
     }
 }
 
+// Initialize or validate session
+async function initializeSession() {
+    try {
+        // Check if session manager is loaded
+        if (typeof sessionManager === 'undefined') {
+            console.warn('⚠️ Session manager not loaded');
+            return;
+        }
+
+        // First, try to validate existing session
+        const isValid = await sessionManager.validateSession();
+        
+        if (!isValid) {
+            // No valid session found, create new one
+            console.log('📝 Creating new session...');
+            await sessionManager.createSession();
+        } else {
+            console.log('✅ Session validated');
+        }
+
+        // Update activity every 5 minutes
+        setInterval(async () => {
+            await sessionManager.updateActivity();
+        }, 5 * 60 * 1000);
+
+    } catch (error) {
+        console.error('❌ Session initialization error:', error);
+    }
+}
+
 // Load current user profile
 async function loadCurrentUser() {
     try {
@@ -169,9 +202,18 @@ async function loadPrivateKey() {
         
         console.log('🔍 Looking for private key for user:', currentUser.id);
         
-        // Get password from sessionStorage (set during login) or fallback to email
+        // Get password from multiple sources in priority order
         const { data: { user } } = await supabaseClient.auth.getUser();
-        const password = sessionStorage.getItem('tempPassword') || user.email;
+        let password = sessionStorage.getItem('tempPassword') || 
+                       sessionStorage.getItem('pendingPassword') ||
+                       localStorage.getItem(`flowsec-userpass-${currentUser.id}`) ||
+                       user.email;
+        
+        // If password was found in sessionStorage, store it in localStorage for future use
+        if (sessionStorage.getItem('tempPassword') || sessionStorage.getItem('pendingPassword')) {
+            localStorage.setItem(`flowsec-userpass-${currentUser.id}`, password);
+            console.log('✅ Password cached for future sessions');
+        }
         
         // Check if private key exists in localStorage for THIS user
         if (!EncryptionService.hasPrivateKey(currentUser.id)) {
@@ -546,10 +588,10 @@ async function loadMessages() {
         `;
         
         // Fetch messages between current user and selected user
-        // We store E2EE messages as: encrypted_content, encrypted_aes_key, iv
+        // We store E2EE messages as: encrypted_content, encrypted_aes_key, encrypted_aes_key_sender, iv
         const { data: messages, error } = await supabaseClient
             .from('messages')
-            .select('id, sender_id, receiver_id, encrypted_content, encrypted_aes_key, iv, app_ciphertext, app_iv, created_at')
+            .select('id, sender_id, receiver_id, encrypted_content, encrypted_aes_key, encrypted_aes_key_sender, iv, app_ciphertext, app_iv, created_at')
             .or(`and(sender_id.eq.${currentUser.id},receiver_id.eq.${selectedUser.id}),and(sender_id.eq.${selectedUser.id},receiver_id.eq.${currentUser.id})`)
             .order('created_at', { ascending: true });
         
@@ -585,6 +627,7 @@ async function loadMessages() {
                 }
                 // Decrypt E2EE message locally using the user's private key
                 else if (msg.encrypted_content && msg.iv) {
+                    // Only use local decryption if we have the appropriate encrypted key
                     if (!privateKey) {
                         console.warn('🔒 Private key not loaded; cannot decrypt message');
                         decryptedText = '[🔐 Click "Generate Keys" button below to decrypt messages]';
@@ -592,37 +635,49 @@ async function loadMessages() {
                         try {
                             // Choose the correct encrypted AES key
                             let encryptedAESKey;
-                            if (isSentByMe && msg.encrypted_aes_key_sender) {
-                                // Sent message: use sender's encrypted key
-                                encryptedAESKey = msg.encrypted_aes_key_sender;
-                                console.log('🔓 Decrypting sent message with sender key');
-                            } else if (!isSentByMe && msg.encrypted_aes_key) {
+                            if (isSentByMe) {
+                                // Sent message: try sender's encrypted key first, fallback to recipient key
+                                encryptedAESKey = msg.encrypted_aes_key_sender || msg.encrypted_aes_key;
+                                if (msg.encrypted_aes_key_sender) {
+                                    console.log('🔓 Decrypting sent message with sender key');
+                                } else if (msg.encrypted_aes_key) {
+                                    console.log('⚠️ Using recipient key for sent message (sender key missing)');
+                                } else {
+                                    console.error('❌ No encryption key found for sent message:', msg.id);
+                                }
+                            } else {
                                 // Received message: use recipient's encrypted key
                                 encryptedAESKey = msg.encrypted_aes_key;
                                 console.log('🔓 Decrypting received message with recipient key');
-                            } else {
-                                // No appropriate key available
-                                throw new Error('No encrypted AES key available');
                             }
 
-                            const packageObj = {
-                                encryptedAESKey: encryptedAESKey,
-                                iv: msg.iv,
-                                encryptedData: msg.encrypted_content
-                            };
-                            decryptedText = await EncryptionService.decryptMessage(packageObj, privateKey);
+                            if (encryptedAESKey) {
+                                const packageObj = {
+                                    encryptedAESKey: encryptedAESKey,
+                                    iv: msg.iv,
+                                    encryptedData: msg.encrypted_content
+                                };
+                                decryptedText = await EncryptionService.decryptMessage(packageObj, privateKey);
+                                console.log('✅ Message decrypted successfully');
+                            } else {
+                                console.error('❌ No encrypted AES key found for message ID:', msg.id, {
+                                    isSent: isSentByMe,
+                                    hasSenderKey: !!msg.encrypted_aes_key_sender,
+                                    hasRecipientKey: !!msg.encrypted_aes_key
+                                });
+                                decryptedText = '[Message key not available - please check database schema]';
+                            }
                         } catch (e) {
                             console.error('❌ Failed to decrypt message locally:', e);
-                            if (isSentByMe) {
-                                // Check if it's due to missing sender encryption column
-                                if (!msg.encrypted_aes_key_sender) {
-                                    decryptedText = '[Old message - sent before dual encryption was enabled. Run database migration to see future sent messages.]';
-                                } else {
-                                    decryptedText = '[Sent message - decryption failed]';
-                                }
-                            } else {
-                                decryptedText = '[Failed to decrypt message]';
-                            }
+                            console.error('Message details:', {
+                                id: msg.id,
+                                isSent: isSentByMe,
+                                hasSenderKey: !!msg.encrypted_aes_key_sender,
+                                hasRecipientKey: !!msg.encrypted_aes_key,
+                                hasIV: !!msg.iv,
+                                hasContent: !!msg.encrypted_content
+                            });
+                            decryptedText = '[Failed to decrypt message - check console for details]';
                         }
                     }
                 } else if (msg.app_ciphertext && msg.app_iv) {
@@ -728,14 +783,18 @@ async function sendMessage() {
         
         // Dual encryption: encrypt message for both sender and recipient
         let encryptedPackage;
-        if (currentUser.public_key) {
+        if (currentUser.public_key && privateKey) {
             const senderPub = await EncryptionService.importPublicKey(currentUser.public_key);
             encryptedPackage = await EncryptionService.encryptMessageDual(message, recipientPub, senderPub);
             console.log('🔐 Message encrypted for both sender and recipient');
+            console.log('✅ Dual encryption keys created:', {
+                recipientKey: !!encryptedPackage.encryptedAESKey,
+                senderKey: !!encryptedPackage.encryptedAESKeySender
+            });
         } else {
             // Fallback: encrypt only for recipient
             encryptedPackage = await EncryptionService.encryptMessage(message, recipientPub);
-            console.warn('⚠️ Sender has no public key - message encrypted only for recipient');
+            console.warn('⚠️ Sender has no public key or private key - message encrypted only for recipient');
         }
 
         const messagePayload = {
@@ -747,6 +806,13 @@ async function sendMessage() {
             iv: encryptedPackage.iv,
             created_at: new Date().toISOString()
         };
+        
+        console.log('📝 Message payload to save:', {
+            ...messagePayload,
+            encrypted_content: messagePayload.encrypted_content.substring(0, 50) + '...',
+            encrypted_aes_key: messagePayload.encrypted_aes_key.substring(0, 50) + '...',
+            encrypted_aes_key_sender: messagePayload.encrypted_aes_key_sender ? messagePayload.encrypted_aes_key_sender.substring(0, 50) + '...' : 'null'
+        });
 
         const { data: messageData, error: saveError } = await supabaseClient
             .from('messages')
@@ -801,11 +867,20 @@ function displayMessage(message) {
     
     const encryptionBadge = message.encrypted ? '<i class="fas fa-lock" style="font-size: 10px; margin-left: 5px;" title="Encrypted"></i>' : '';
     
+    // Add delete button for sent messages
+    const deleteButton = isSent && message.id ? `
+        <button class="message-delete-btn" onclick="deleteMessage('${message.id}')" title="Delete message">
+            <i class="fas fa-trash"></i>
+        </button>
+    ` : '';
+    
     const messageDiv = document.createElement('div');
     messageDiv.className = `message ${isSent ? 'sent' : 'received'}`;
+    messageDiv.setAttribute('data-message-id', message.id || '');
     messageDiv.innerHTML = `
+        ${deleteButton}
         <div class="message-content">
-            <div class="message-text">${escapeHtml(message.text)}</div>
+            <div class="message-text">${linkifyText(message.text)}</div>
             <span class="message-time">${time} ${encryptionBadge}</span>
         </div>
     `;
@@ -819,6 +894,26 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+// Convert URLs in text to clickable links
+function linkifyText(text) {
+    // First escape HTML to prevent XSS
+    const escaped = escapeHtml(text);
+    
+    // URL regex pattern - matches http(s), ftp, and www links
+    const urlPattern = /(\b(https?|ftp):\/\/[-A-Z0-9+&@#\/%?=~_|!:,.;]*[-A-Z0-9+&@#\/%=~_|]|www\.[-A-Z0-9+&@#\/%?=~_|!:,.;]*[-A-Z0-9+&@#\/%=~_|])/gi;
+    
+    // Replace URLs with clickable links
+    return escaped.replace(urlPattern, (url) => {
+        // Add protocol if missing (for www. links)
+        const href = url.startsWith('www.') ? 'http://' + url : url;
+        
+        // Truncate long URLs for display
+        const displayUrl = url.length > 50 ? url.substring(0, 47) + '...' : url;
+        
+        return `<a href="${href}" target="_blank" rel="noopener noreferrer" class="message-link" title="${url}">${displayUrl}</a>`;
+    });
 }
 
 // Show error message in chat area
@@ -843,6 +938,9 @@ function showError(message) {
 
 // Setup event listeners
 function setupEventListeners() {
+    // Mobile menu toggle
+    setupMobileMenu();
+    
     // Send message button
     document.getElementById('send-btn').addEventListener('click', sendMessage);
     
@@ -917,6 +1015,9 @@ function setupEventListeners() {
     
     // File input change
     document.getElementById('file-input').addEventListener('change', handleFileSelect);
+    
+    // Setup emoji picker
+    setupEmojiPicker();
     
     // Close modals on Escape key
     document.addEventListener('keydown', (e) => {
@@ -1299,7 +1400,7 @@ async function confirmSignOut() {
         const keysToRemove = [];
         for (let i = 0; i < localStorage.length; i++) {
             const key = localStorage.key(i);
-            if (key && (key.startsWith('privateKey_') || key.startsWith('encrypted_privateKey_') || key.startsWith('flowsec-privatekey-'))) {
+            if (key && (key.startsWith('privateKey_') || key.startsWith('encrypted_privateKey_') || key.startsWith('flowsec-privatekey-') || key.startsWith('flowsec-userpass-'))) {
                 keysToRemove.push(key);
             }
         }
@@ -1312,7 +1413,7 @@ async function confirmSignOut() {
         sessionStorage.removeItem('tempPassword');
         sessionStorage.removeItem('pendingPassword');
         sessionStorage.removeItem('tempEmail');
-        console.log('🗑️ Cleared password from sessionStorage');
+        console.log('🗑️ Cleared password from sessionStorage and localStorage');
         
         console.log('✅ Cleared encryption keys from device');
         
@@ -1474,13 +1575,23 @@ async function handleFileSelect(event) {
 
         // Get recipient's public key
         const recipientPubKey = await EncryptionService.importPublicKey(selectedUser.public_key);
+        
+        // Get sender's public key for dual encryption
+        let senderPubKey = null;
+        if (currentUser.public_key) {
+            senderPubKey = await EncryptionService.importPublicKey(currentUser.public_key);
+            console.log('🔐 Enabling dual encryption for file (sender + recipient)');
+        } else {
+            console.warn('⚠️ Sender has no public key - file encrypted only for recipient');
+        }
 
         // Send file (encrypt, upload, scan with VirusTotal)
         const fileRecord = await fileService.sendFile(
             file,
             currentUser.id,
             selectedUser.id,
-            recipientPubKey
+            recipientPubKey,
+            senderPubKey
         );
 
         console.log('✅ File sent successfully:', fileRecord);
@@ -1512,12 +1623,21 @@ function displayFileMessage(fileRecord, isSent) {
 
     const messageDiv = document.createElement('div');
     messageDiv.className = `message ${isSent ? 'sent' : 'received'}`;
+    messageDiv.setAttribute('data-file-id', fileRecord.id);
 
     const vtBadge = getFileVirusTotalBadge(fileRecord);
     const fileIcon = getFileIconForType(fileRecord.file_type);
     const timestamp = new Date(fileRecord.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    
+    // Add delete button for sent files
+    const deleteButton = isSent ? `
+        <button class="message-delete-btn" onclick="deleteFile('${fileRecord.id}')" title="Delete file">
+            <i class="fas fa-trash"></i>
+        </button>
+    ` : '';
 
     messageDiv.innerHTML = `
+        ${deleteButton}
         <div class="message-content file-message">
             <div class="file-attachment">
                 <div class="file-icon">${fileIcon}</div>
@@ -1601,11 +1721,16 @@ async function downloadFileFromChat(fileId) {
 
         if (!privateKey) {
             showError('Cannot decrypt file - private key not available. Please refresh and login again.');
+            // Reset buttons on error
+            allDownloadBtns.forEach(btn => {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-download"></i>';
+            });
             return;
         }
 
         // Decrypt and download
-        const file = await fileService.receiveFile(fileRecord, privateKey);
+        const file = await fileService.receiveFile(fileRecord, privateKey, currentUser.id);
 
         // Create download link
         const url = URL.createObjectURL(file);
@@ -1640,6 +1765,8 @@ async function downloadFileFromChat(fileId) {
 // Global function for onclick handlers
 window.downloadFileFromChat = downloadFileFromChat;
 window.regenerateKeys = regenerateKeys;
+window.deleteMessage = deleteMessage;
+window.deleteFile = deleteFile;
 
 /**
  * Show file upload progress
@@ -1720,4 +1847,268 @@ function showSuccess(message) {
 
 function showError(message) {
     showNotification(message, 'error');
+}
+
+/**
+ * Setup mobile menu toggle functionality
+ */
+function setupMobileMenu() {
+    const sidebar = document.querySelector('.sidebar');
+    const menuToggle = document.getElementById('mobile-menu-toggle');
+    const overlay = document.getElementById('sidebar-overlay');
+    
+    if (!menuToggle || !sidebar || !overlay) {
+        // Elements might not exist on some pages
+        return;
+    }
+    
+    // Toggle sidebar
+    menuToggle.addEventListener('click', () => {
+        sidebar.classList.toggle('active');
+        overlay.classList.toggle('active');
+        menuToggle.classList.toggle('sidebar-open');
+    });
+    
+    // Close sidebar when overlay is clicked
+    overlay.addEventListener('click', () => {
+        sidebar.classList.remove('active');
+        overlay.classList.remove('active');
+        menuToggle.classList.remove('sidebar-open');
+    });
+    
+    // Close sidebar when a user is selected (on mobile)
+    const userItems = document.querySelectorAll('.user-item');
+    userItems.forEach(item => {
+        item.addEventListener('click', () => {
+            if (window.innerWidth <= 768) {
+                sidebar.classList.remove('active');
+                overlay.classList.remove('active');
+                menuToggle.classList.remove('sidebar-open');
+            }
+        });
+    });
+}
+
+// =====================================================
+// EMOJI PICKER FUNCTIONALITY
+// =====================================================
+
+const emojiData = {
+    smileys: ['😀','😃','😄','😁','😆','😅','🤣','😂','🙂','🙃','😉','😊','😇','🥰','😍','🤩','😘','😗','😚','😙','🥲','😋','😛','😜','🤪','😝','🤑','🤗','🤭','🤫','🤔','🤐','🤨','😐','😑','😶','😏','😒','🙄','😬','🤥','😌','😔','😪','🤤','😴','😷','🤒','🤕','🤢','🤮','🤧','🥵','🥶','🥴','😵','🤯','🤠','🥳','😎','🤓','🧐'],
+    gestures: ['👋','🤚','🖐','✋','🖖','👌','🤌','🤏','✌️','🤞','🤟','🤘','🤙','👈','👉','👆','🖕','👇','☝️','👍','👎','✊','👊','🤛','🤜','👏','🙌','👐','🤲','🤝','🙏','✍️','💪','🦵','🦶','👂','🦻','👃','🧠','🦷','🦴','👀','👁','👅','👄','💋'],
+    hearts: ['❤️','🧡','💛','💚','💙','💜','🖤','🤍','🤎','💔','❣️','💕','💞','💓','💗','💖','💘','💝','💟','💌','❤️‍🔥','❤️‍🩹','💏','💑','👨‍❤️‍👨','👩‍❤️‍👩','💐','🌹','🥀','🌺','🌸','🌼','🌻','🌷'],
+    animals: ['🐶','🐱','🐭','🐹','🐰','🦊','🐻','🐼','🐨','🐯','🦁','🐮','🐷','🐽','🐸','🐵','🙈','🙉','🙊','🐒','🐔','🐧','🐦','🐤','🐣','🐥','🦆','🦅','🦉','🦇','🐺','🐗','🐴','🦄','🐝','🐛','🦋','🐌','🐞','🐜','🦟','🦗','🕷','🕸','🦂','🐢','🐍','🦎','🦖','🦕','🐙','🦑','🦐','🦞','🦀','🐡','🐠','🐟','🐬','🐳','🐋','🦈'],
+    food: ['🍕','🍔','🍟','🌭','🍿','🧂','🥓','🥚','🍳','🧇','🥞','🧈','🍞','🥐','🥖','🥨','🥯','🧀','🥗','🥙','🌮','🌯','🥪','🍖','🍗','🥩','🍤','🍱','🍘','🍙','🍚','🍛','🍜','🦪','🍣','🍤','🍥','🥮','🍢','🍡','🍧','🍨','🍦','🥧','🧁','🍰','🎂','🍮','🍭','🍬','🍫','🍿','🍩','🍪','🌰','🥜'],
+    activities: ['⚽','🏀','🏈','⚾','🥎','🎾','🏐','🏉','🥏','🎱','🪀','🏓','🏸','🏒','🏑','🥍','🏏','🥅','⛳','🪁','🏹','🎣','🤿','🥊','🥋','🎽','🛹','🛼','🛷','⛸','🥌','🎿','⛷','🏂','🪂','🏋️','🤼','🤸','🤺','⛹️','🤾','🏌️','🏇','🧘','🏄','🏊','🤽','🚣','🧗','🚴','🚵','🎖','🏆','🏅','🥇','🥈','🥉'],
+    travel: ['🚗','🚕','🚙','🚌','🚎','🏎','🚓','🚑','🚒','🚐','🛻','🚚','🚛','🚜','🦯','🦽','🦼','🛴','🚲','🛵','🏍','🛺','🚨','🚔','🚍','🚘','🚖','🚡','🚠','🚟','🚃','🚋','🚞','🚝','🚄','🚅','🚈','🚂','🚆','🚇','🚊','🚉','✈️','🛫','🛬','🛩','💺','🛰','🚁','🛸','🚀','🛶','⛵','🚤','🛥','🛳','⛴','🚢','⚓','⛽','🚧'],
+    objects: ['💡','🔦','🏮','🪔','📱','💻','⌨️','🖥','🖨','🖱','🖲','🕹','🗜','💾','💿','📀','📼','📷','📸','📹','🎥','📽','🎞','📞','☎️','📟','📠','📺','📻','🎙','🎚','🎛','🧭','⏱','⏲','⏰','🕰','⌛','⏳','📡','🔋','🔌','💡','🔦','🕯','🪔','🧯','🛢','💸','💵','💴','💶','💷','💰','💳','🪙','💎','⚖️','🪜','🧰','🪛','🔧','🔨','⚒','🛠','⛏','🪚','🔩','⚙️','🪤','🧱','⛓','🧲','🔫','💣','🧨','🪓','🔪','🗡','⚔️','🛡','🚬','⚰️','🪦','⚱️','🏺','🔮','📿','🧿','💈','⚗️','🔭','🔬','🕳','🩹','🩺','💊','💉','🩸','🧬','🦠','🧫','🧪','🌡','🧹','🪠','🧺','🧻','🚽','🚰','🚿','🛁','🪤','🪒','🧼','🪥','🪒','🧴','🧷','🧹','🧺','🧻','🪣','🧼','🪥','🧽','🧯','🛒']
+};
+
+let currentEmojiCategory = 'smileys';
+
+function setupEmojiPicker() {
+    const emojiBtn = document.getElementById('emoji-btn');
+    const emojiPicker = document.getElementById('emoji-picker');
+    const emojiClose = document.getElementById('emoji-close');
+    const emojiGrid = document.getElementById('emoji-grid');
+    const messageInput = document.getElementById('message-input');
+    
+    if (!emojiBtn || !emojiPicker) return;
+    
+    // Toggle emoji picker
+    emojiBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const isVisible = emojiPicker.style.display === 'flex';
+        emojiPicker.style.display = isVisible ? 'none' : 'flex';
+        if (!isVisible) {
+            renderEmojis(currentEmojiCategory);
+        }
+    });
+    
+    // Close emoji picker
+    emojiClose.addEventListener('click', () => {
+        emojiPicker.style.display = 'none';
+    });
+    
+    // Close on outside click
+    document.addEventListener('click', (e) => {
+        if (!emojiPicker.contains(e.target) && e.target !== emojiBtn && !emojiBtn.contains(e.target)) {
+            emojiPicker.style.display = 'none';
+        }
+    });
+    
+    // Category buttons
+    document.querySelectorAll('.emoji-category').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.emoji-category').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            const category = btn.dataset.category;
+            currentEmojiCategory = category;
+            renderEmojis(category);
+        });
+    });
+    
+    // Render emojis function
+    function renderEmojis(category) {
+        const emojis = emojiData[category] || emojiData.smileys;
+        emojiGrid.innerHTML = emojis.map(emoji => `
+            <button class="emoji-item" data-emoji="${emoji}">${emoji}</button>
+        `).join('');
+        
+        // Add click handlers
+        emojiGrid.querySelectorAll('.emoji-item').forEach(item => {
+            item.addEventListener('click', () => {
+                const emoji = item.dataset.emoji;
+                const cursorPos = messageInput.selectionStart;
+                const textBefore = messageInput.value.substring(0, cursorPos);
+                const textAfter = messageInput.value.substring(cursorPos);
+                messageInput.value = textBefore + emoji + textAfter;
+                messageInput.focus();
+                messageInput.selectionStart = messageInput.selectionEnd = cursorPos + emoji.length;
+                emojiPicker.style.display = 'none';
+            });
+        });
+    }
+    
+    // Initial render
+    renderEmojis(currentEmojiCategory);
+}
+
+// =====================================================
+// DELETE MESSAGE FUNCTIONALITY
+// =====================================================
+
+async function deleteMessage(messageId) {
+    if (!messageId) {
+        console.error('No message ID provided');
+        return;
+    }
+    
+    if (!confirm('Delete this message? This action cannot be undone.')) {
+        return;
+    }
+    
+    try {
+        console.log('🗑️ Deleting message:', messageId);
+        
+        // Delete from database
+        const { error } = await supabaseClient
+            .from('messages')
+            .delete()
+            .eq('id', messageId)
+            .eq('sender_id', currentUser.id); // Only allow deleting own messages
+        
+        if (error) {
+            throw error;
+        }
+        
+        console.log('✅ Message deleted from database');
+        
+        // Remove from UI
+        const messageElement = document.querySelector(`[data-message-id="${messageId}"]`);
+        if (messageElement) {
+            messageElement.style.animation = 'fadeOut 0.3s ease';
+            setTimeout(() => {
+                messageElement.remove();
+                
+                // Check if no messages left
+                const messagesArea = document.getElementById('messages-area');
+                if (messagesArea.children.length === 0) {
+                    messagesArea.innerHTML = `
+                        <div style="text-align: center; padding: 20px; color: #999;">
+                            <p>No messages yet. Start the conversation!</p>
+                        </div>
+                    `;
+                }
+            }, 300);
+        }
+        
+        // Remove from cache
+        if (window.sentMessagesCache && window.sentMessagesCache[messageId]) {
+            delete window.sentMessagesCache[messageId];
+        }
+        
+        showSuccess('Message deleted successfully');
+        
+    } catch (error) {
+        console.error('❌ Error deleting message:', error);
+        showError('Failed to delete message: ' + error.message);
+    }
+}
+
+// =====================================================
+// DELETE FILE FUNCTIONALITY
+// =====================================================
+
+async function deleteFile(fileId) {
+    if (!fileId) {
+        console.error('No file ID provided');
+        return;
+    }
+    
+    if (!confirm('Delete this file? This action cannot be undone and will remove the file from storage.')) {
+        return;
+    }
+    
+    try {
+        console.log('🗑️ Deleting file:', fileId);
+        
+        // Get file record first to delete from storage
+        const { data: fileRecord, error: fetchError } = await supabaseClient
+            .from('files')
+            .select('*')
+            .eq('id', fileId)
+            .eq('sender_id', currentUser.id) // Only allow deleting own files
+            .single();
+        
+        if (fetchError) {
+            throw fetchError;
+        }
+        
+        if (!fileRecord) {
+            throw new Error('File not found or you do not have permission to delete it');
+        }
+        
+        // Delete from storage
+        if (fileRecord.storage_path) {
+            const { error: storageError } = await supabaseClient.storage
+                .from('encrypted-files')
+                .remove([fileRecord.storage_path]);
+            
+            if (storageError) {
+                console.warn('⚠️ Storage deletion warning:', storageError);
+                // Continue even if storage deletion fails
+            } else {
+                console.log('✅ File deleted from storage');
+            }
+        }
+        
+        // Delete from database
+        const { error: dbError } = await supabaseClient
+            .from('files')
+            .delete()
+            .eq('id', fileId);
+        
+        if (dbError) {
+            throw dbError;
+        }
+        
+        console.log('✅ File deleted from database');
+        
+        // Remove from UI
+        const fileElement = document.querySelector(`[data-file-id="${fileId}"]`);
+        if (fileElement) {
+            fileElement.style.animation = 'fadeOut 0.3s ease';
+            setTimeout(() => fileElement.remove(), 300);
+        }
+        
+        showSuccess('File deleted successfully');
+        
+        // Reload messages to update file list
+        await loadMessages();
+        
+    } catch (error) {
+        console.error('❌ Error deleting file:', error);
+        showError('Failed to delete file: ' + error.message);
+    }
 }

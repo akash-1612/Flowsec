@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Completing Setup - Flowsec</title>
     <link rel="stylesheet" href="../css/auth.css">
+    <link rel="stylesheet" href="../css/responsive.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" crossorigin="anonymous">
     <style>
         .setup-container {
@@ -145,6 +146,10 @@
                 // Get password from sessionStorage (stored during signup)
                 const password = sessionStorage.getItem('pendingPassword') || user.email;
                 console.log('🔐 Using password for encryption:', password ? 'Yes' : 'No');
+                
+                // Store password in localStorage for future use (so user doesn't need to re-enter)
+                localStorage.setItem(`flowsec-userpass-${user.id}`, password);
+                console.log('✅ Password cached for future sessions');
                 
                 // Store private key locally (encrypted with user's password)
                 console.log('💾 Storing private key locally with userId:', user.id);
